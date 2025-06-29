@@ -364,12 +364,24 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) for deta
 
 <div align="center">
 
+**[Website](https://dreamemulator.dev)** • **[Discord](https://discord.gg/dreamemulator)** • **[Twitter](https://twitter.com/dreamemulator)**
+
 Made with ❤️ by developers who believe everyone should be able to create games
 
 </div>
 
-![image](https://github.com/user-attachments/assets/d478f6a4-4793-472e-a91f-9dca385b5ff1)
-![image](https://github.com/user-attachments/assets/7817dac4-5011-4e3d-bd68-f826bd9d953d)
-![image](https://github.com/user-attachments/assets/9304b75e-b883-4a9c-b17a-530e7313a0c8)
-![image](https://github.com/user-attachments/assets/e05c7e35-0a5f-476a-b0fe-a6c82f5a18dc)
+<br />
 
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/d478f6a4-4793-472e-a91f-9dca385b5ff1" alt="Dream Emulator Main Menu" width="45%" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="https://github.com/user-attachments/assets/7817dac4-5011-4e3d-bd68-f826bd9d953d" alt="Engine Selection" width="45%" />
+</div>
+
+<br />
+
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/9304b75e-b883-4a9c-b17a-530e7313a0c8" alt="Top-Down Game Creator" width="45%" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="https://github.com/user-attachments/assets/e05c7e35-0a5f-476a-b0fe-a6c82f5a18dc" alt="Game Editor Interface" width="45%" />
+</div>
