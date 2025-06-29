@@ -1,0 +1,10 @@
+# Engine dependencies
+# TODO: Copy content from "Integrating Dream Engine with Tauri" artifact
+
+[package]
+name = "dream-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Placeholder - copy from artifact

@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "engine"]
+
 [package]
 name = "dream-emulator"
 version = "0.1.0"
