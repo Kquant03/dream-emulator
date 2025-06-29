@@ -364,8 +364,6 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) for deta
 
 <div align="center">
 
-**[Website](https://dreamemulator.dev)** • **[Discord](https://discord.gg/dreamemulator)** • **[Twitter](https://twitter.com/dreamemulator)**
-
 Made with ❤️ by developers who believe everyone should be able to create games
 
 </div>
