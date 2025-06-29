@@ -1,499 +1,355 @@
 // src-tauri/engine/src/compiler/mod.rs
+use crate::{VisualScript, VisualScriptNode, Project};
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::fs;
-use serde::{Deserialize, Serialize};
-use crate::{VisualScript, Project};
 
-#[derive(Debug, Clone)]
-pub enum BuildTarget {
-    Native,
-    WebAssembly,
-    Windows,
-    Linux,
-    MacOS,
-}
-
-#[derive(Debug)]
-pub struct BuildResult {
-    pub executable_path: String,
-    pub assets_path: String,
-    pub size_bytes: u64,
-    pub warnings: Vec<String>,
-}
-
-pub struct GameCompiler {
-    project: Project,
-    target: BuildTarget,
-    optimize_level: OptimizeLevel,
-}
-
-#[derive(Debug, Clone)]
-pub enum OptimizeLevel {
-    Debug,
-    Release,
-    ReleaseSmall,  // Optimize for size
-}
-
-impl GameCompiler {
-    pub fn new(project: Project, target: BuildTarget) -> Self {
-        Self {
-            project,
-            target,
-            optimize_level: OptimizeLevel::Release,
-        }
-    }
-    
-    pub async fn compile(&self) -> Result<BuildResult, CompilerError> {
-        let build_dir = self.prepare_build_directory()?;
-        
-        // Step 1: Compile visual scripts to Rust
-        self.generate_systems_code(&build_dir).await?;
-        
-        // Step 2: Generate entity data
-        self.generate_entity_data(&build_dir)?;
-        
-        // Step 3: Process and optimize assets
-        self.process_assets(&build_dir).await?;
-        
-        // Step 4: Generate main.rs with embedded data
-        self.generate_main_file(&build_dir)?;
-        
-        // Step 5: Create Cargo.toml
-        self.generate_cargo_toml(&build_dir)?;
-        
-        // Step 6: Build the game
-        let executable = self.build_executable(&build_dir).await?;
-        
-        // Step 7: Package final game
-        let result = self.package_game(&build_dir, executable).await?;
-        
-        Ok(result)
-    }
-    
-    fn prepare_build_directory(&self) -> Result<PathBuf, CompilerError> {
-        let build_dir = Path::new("target/game_builds").join(&self.project.id);
-        
-        // Clean previous build
-        if build_dir.exists() {
-            fs::remove_dir_all(&build_dir)?;
-        }
-        
-        // Create directory structure
-        fs::create_dir_all(&build_dir)?;
-        fs::create_dir_all(build_dir.join("src"))?;
-        fs::create_dir_all(build_dir.join("assets"))?;
-        
-        Ok(build_dir)
-    }
-    
-    async fn generate_systems_code(&self, build_dir: &Path) -> Result<(), CompilerError> {
-        let mut all_systems = Vec::new();
-        
-        // Compile each visual script
-        for script in &self.project.scripts {
-            let compiled = compile_visual_script(script)?;
-            all_systems.push(compiled.code);
-        }
-        
-        // Write systems.rs
-        let systems_code = format!(
-            r#"
-use dream_engine::{{World, PhysicsWorld, System}};
-
-{}
-
-pub fn register_systems(schedule: &mut SystemSchedule) {{
-    {}
-}}
-"#,
-            all_systems.join("\n\n"),
-            self.project.scripts.iter()
-                .map(|s| format!("schedule.add_system(Box::new({}System {{}});", to_rust_name(&s.name)))
-                .collect::<Vec<_>>()
-                .join("\n    ")
-        );
-        
-        fs::write(build_dir.join("src/systems.rs"), systems_code)?;
-        Ok(())
-    }
-    
-    fn generate_entity_data(&self, build_dir: &Path) -> Result<(), CompilerError> {
-        let mut entities_code = String::new();
-        
-        entities_code.push_str("use dream_engine::*;\n\n");
-        entities_code.push_str("pub fn create_entities(world: &mut World) {\n");
-        
-        // Generate entity creation code for each scene
-        for scene in &self.project.scenes {
-            for entity in &scene.objects {
-                entities_code.push_str(&format!(
-                    r#"    {{
-        let entity = world.create_entity();
-        world.add_component(entity, Transform {{
-            position: Vec3 {{ x: {}f32, y: {}f32, z: 0.0 }},
-            rotation: Quat::from_rotation_z({}f32),
-            scale: Vec3 {{ x: {}f32, y: {}f32, z: 1.0 }},
-        }});
-"#,
-                    entity.position.x, entity.position.y,
-                    entity.rotation,
-                    entity.scale.x, entity.scale.y
-                ));
-                
-                // Add other components
-                for component in &entity.components {
-                    entities_code.push_str(&self.generate_component_code(component)?);
-                }
-                
-                entities_code.push_str("    }\n");
-            }
-        }
-        
-        entities_code.push_str("}\n");
-        
-        fs::write(build_dir.join("src/entities.rs"), entities_code)?;
-        Ok(())
-    }
-    
-    async fn process_assets(&self, build_dir: &Path) -> Result<(), CompilerError> {
-        let assets_dir = build_dir.join("assets");
-        
-        for asset in &self.project.assets {
-            match asset.asset_type.as_str() {
-                "texture" => {
-                    // Optimize textures
-                    self.optimize_texture(&asset.path, &assets_dir).await?;
-                }
-                "audio" => {
-                    // Compress audio
-                    self.compress_audio(&asset.path, &assets_dir).await?;
-                }
-                _ => {
-                    // Copy as-is
-                    let dest = assets_dir.join(&asset.name);
-                    fs::copy(&asset.path, dest)?;
-                }
-            }
-        }
-        
-        // Generate asset manifest
-        let manifest = AssetManifest {
-            textures: self.project.assets.iter()
-                .filter(|a| a.asset_type == "texture")
-                .map(|a| (a.id.clone(), format!("assets/{}", a.name)))
-                .collect(),
-            audio: self.project.assets.iter()
-                .filter(|a| a.asset_type == "audio")
-                .map(|a| (a.id.clone(), format!("assets/{}", a.name)))
-                .collect(),
-        };
-        
-        let manifest_data = bincode::serialize(&manifest)?;
-        fs::write(assets_dir.join("manifest.bin"), manifest_data)?;
-        
-        Ok(())
-    }
-    
-    fn generate_main_file(&self, build_dir: &Path) -> Result<(), CompilerError> {
-        let main_code = format!(
-            r#"
-use dream_engine::{{DreamEngine, EngineConfig}};
-
-mod systems;
-mod entities;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {{
-    // Initialize engine
-    let config = EngineConfig {{
-        target_fps: 60,
-        fixed_timestep: 1.0 / 60.0,
-        max_entities: 10000,
-    }};
-    
-    let mut engine = DreamEngine::new(config)?;
-    
-    // Register all systems
-    systems::register_systems(engine.systems_mut());
-    
-    // Create initial entities
-    entities::create_entities(engine.world_mut());
-    
-    // Load embedded assets
-    let asset_manifest = include_bytes!("../assets/manifest.bin");
-    engine.load_asset_manifest(asset_manifest)?;
-    
-    // Run the game
-    engine.run()?;
-    
-    Ok(())
-}}
-
-// Embedded asset data for standalone executable
-const ASSET_DATA: &[u8] = include_bytes!("../assets/assets.pak");
-"#
-        );
-        
-        fs::write(build_dir.join("src/main.rs"), main_code)?;
-        Ok(())
-    }
-    
-    fn generate_cargo_toml(&self, build_dir: &Path) -> Result<(), CompilerError> {
-        let cargo_toml = format!(
-            r#"[package]
-name = "{}"
-version = "1.0.0"
-edition = "2021"
-
-[dependencies]
-dream-engine = {{ path = "../../engine" }}
-
-[profile.release]
-opt-level = {}
-lto = true
-codegen-units = 1
-strip = true
-
-[profile.release-small]
-inherits = "release"
-opt-level = "z"
-panic = "abort"
-
-[[bin]]
-name = "{}"
-path = "src/main.rs"
-"#,
-            self.project.name.to_lowercase().replace(' ', "_"),
-            match self.optimize_level {
-                OptimizeLevel::Debug => "0",
-                OptimizeLevel::Release => "3",
-                OptimizeLevel::ReleaseSmall => "\"z\"",
-            },
-            self.project.name.to_lowercase().replace(' ', "_")
-        );
-        
-        fs::write(build_dir.join("Cargo.toml"), cargo_toml)?;
-        Ok(())
-    }
-    
-    async fn build_executable(&self, build_dir: &Path) -> Result<PathBuf, CompilerError> {
-        let mut cmd = Command::new("cargo");
-        cmd.current_dir(build_dir);
-        
-        match self.target {
-            BuildTarget::Native => {
-                cmd.arg("build");
-            }
-            BuildTarget::WebAssembly => {
-                cmd.arg("build")
-                   .arg("--target")
-                   .arg("wasm32-unknown-unknown");
-            }
-            BuildTarget::Windows => {
-                cmd.arg("build")
-                   .arg("--target")
-                   .arg("x86_64-pc-windows-gnu");
-            }
-            _ => {
-                cmd.arg("build");
-            }
-        }
-        
-        match self.optimize_level {
-            OptimizeLevel::Debug => {}
-            OptimizeLevel::Release => {
-                cmd.arg("--release");
-            }
-            OptimizeLevel::ReleaseSmall => {
-                cmd.arg("--profile")
-                   .arg("release-small");
-            }
-        }
-        
-        // Use Zig for linking if available (better cross-compilation)
-        if self.has_zig_installed() {
-            cmd.env("CC", "zig cc");
-            cmd.env("CXX", "zig c++");
-        }
-        
-        let output = cmd.output()?;
-        
-        if !output.status.success() {
-            return Err(CompilerError::BuildFailed(
-                String::from_utf8_lossy(&output.stderr).to_string()
-            ));
-        }
-        
-        // Find the built executable
-        let exe_name = self.project.name.to_lowercase().replace(' ', "_");
-        let exe_path = match self.target {
-            BuildTarget::Windows => build_dir.join(format!("target/release/{}.exe", exe_name)),
-            _ => build_dir.join(format!("target/release/{}", exe_name)),
-        };
-        
-        Ok(exe_path)
-    }
-    
-    async fn package_game(&self, build_dir: &Path, executable: PathBuf) -> Result<BuildResult, CompilerError> {
-        let output_dir = Path::new("target/games").join(&self.project.name);
-        fs::create_dir_all(&output_dir)?;
-        
-        // Copy executable
-        let final_exe = output_dir.join(executable.file_name().unwrap());
-        fs::copy(&executable, &final_exe)?;
-        
-        // Copy assets
-        let assets_output = output_dir.join("assets");
-        fs::create_dir_all(&assets_output)?;
-        copy_dir_all(build_dir.join("assets"), &assets_output)?;
-        
-        // Calculate final size
-        let exe_size = fs::metadata(&final_exe)?.len();
-        let assets_size = dir_size(&assets_output)?;
-        
-        // Create launcher script for Linux/Mac
-        if matches!(self.target, BuildTarget::Linux | BuildTarget::MacOS) {
-            let launcher = output_dir.join("launch.sh");
-            fs::write(&launcher, format!(
-                "#!/bin/bash\ncd \"$(dirname \"$0\")\"\n./{}\n",
-                executable.file_name().unwrap().to_str().unwrap()
-            ))?;
-            
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))?;
-                fs::set_permissions(&final_exe, fs::Permissions::from_mode(0o755))?;
-            }
-        }
-        
-        Ok(BuildResult {
-            executable_path: final_exe.to_string_lossy().to_string(),
-            assets_path: assets_output.to_string_lossy().to_string(),
-            size_bytes: exe_size + assets_size,
-            warnings: vec![],
-        })
-    }
-    
-    fn has_zig_installed(&self) -> bool {
-        Command::new("zig")
-            .arg("version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-    
-    fn generate_component_code(&self, component: &Component) -> Result<String, CompilerError> {
-        match component.component_type.as_str() {
-            "Sprite" => {
-                Ok(format!(
-                    r#"        world.add_component(entity, Sprite {{
-            texture_id: "{}".to_string(),
-            color: [1.0, 1.0, 1.0, 1.0],
-            flip_x: false,
-            flip_y: false,
-        }});
-"#,
-                    component.data.get("texture_id").unwrap_or(&"default".to_string())
-                ))
-            }
-            _ => Ok(String::new()),
-        }
-    }
-    
-    async fn optimize_texture(&self, input: &Path, output_dir: &Path) -> Result<(), CompilerError> {
-        // Use image crate or call out to external optimizer
-        // For now, just copy
-        let filename = input.file_name().unwrap();
-        fs::copy(input, output_dir.join(filename))?;
-        Ok(())
-    }
-    
-    async fn compress_audio(&self, input: &Path, output_dir: &Path) -> Result<(), CompilerError> {
-        // Use audio compression library or external tool
-        // For now, just copy
-        let filename = input.file_name().unwrap();
-        fs::copy(input, output_dir.join(filename))?;
-        Ok(())
-    }
+pub struct CompiledSystem {
+    pub name: String,
+    pub code: String,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompilerError {
+    #[error("Unknown node type: {0}")]
+    UnknownNode(String),
+    
+    #[error("Invalid connection: {0}")]
+    InvalidConnection(String),
+    
+    #[error("Code generation failed: {0}")]
+    CodeGeneration(String),
+    
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::Error),
-    
-    #[error("Build failed: {0}")]
-    BuildFailed(String),
-    
-    #[error("Visual script compilation failed: {0}")]
-    ScriptCompilation(String),
 }
 
-#[derive(Serialize, Deserialize)]
-struct AssetManifest {
-    textures: Vec<(String, String)>,
-    audio: Vec<(String, String)>,
+pub fn compile_visual_script(script: &VisualScript) -> Result<CompiledSystem, CompilerError> {
+    let mut compiler = ScriptCompiler::new();
+    compiler.compile(script)
 }
 
-fn to_rust_name(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect::<String>()
-        .split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-            }
+struct ScriptCompiler {
+    code: Vec<String>,
+    indent_level: usize,
+    temp_vars: HashMap<String, String>,
+    var_counter: usize,
+}
+
+impl ScriptCompiler {
+    fn new() -> Self {
+        Self {
+            code: Vec::new(),
+            indent_level: 0,
+            temp_vars: HashMap::new(),
+            var_counter: 0,
+        }
+    }
+    
+    fn compile(&mut self, script: &VisualScript) -> Result<CompiledSystem, CompilerError> {
+        // Generate imports
+        self.write_line("use dream_engine::{World, PhysicsWorld, System, EntityId};");
+        self.write_line("use dream_engine::{Transform, Sprite, RigidBody, Vec2, Vec3};");
+        self.write_line("");
+        
+        // Generate system struct
+        let system_name = self.to_rust_name(&script.name);
+        self.write_line(&format!("pub struct {}System {{", system_name));
+        self.indent();
+        self.write_line("// System state");
+        self.dedent();
+        self.write_line("}");
+        self.write_line("");
+        
+        // Generate system implementation
+        self.write_line(&format!("impl System for {}System {{", system_name));
+        self.indent();
+        
+        self.write_line("fn execute(&mut self, world: &mut World, physics: &mut PhysicsWorld, dt: f32) {");
+        self.indent();
+        
+        // Sort nodes topologically
+        let sorted_nodes = self.topological_sort(&script.nodes, &script.connections)?;
+        
+        // Compile each node
+        for node in sorted_nodes {
+            self.compile_node(node)?;
+        }
+        
+        self.dedent();
+        self.write_line("}");
+        
+        self.dedent();
+        self.write_line("}");
+        
+        Ok(CompiledSystem {
+            name: script.name.clone(),
+            code: self.code.join("\n"),
         })
-        .collect()
-}
-
-fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
-    fs::create_dir_all(&dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        } else {
-            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        }
     }
-    Ok(())
-}
-
-fn dir_size(path: impl AsRef<Path>) -> std::io::Result<u64> {
-    let mut size = 0;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            size += dir_size(entry.path())?;
-        } else {
-            size += metadata.len();
-        }
-    }
-    Ok(size)
-}
-
-// Public API for Tauri commands
-pub async fn compile_project(
-    project_path: &str,
-    output_path: &str,
-    target: BuildTarget,
-) -> Result<BuildResult, CompilerError> {
-    // Load project
-    let project_data = fs::read(project_path)?;
-    let project: Project = serde_json::from_slice(&project_data)
-        .map_err(|e| CompilerError::ScriptCompilation(e.to_string()))?;
     
-    // Compile
-    let compiler = GameCompiler::new(project, target);
-    compiler.compile().await
+    fn compile_node(&mut self, node: &VisualScriptNode) -> Result<(), CompilerError> {
+        self.write_line(&format!("// {}", node.data.get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or(node.get_type())));
+        
+        match node.get_type() {
+            "event/update" => {
+                // Update event is implicit in the execute method
+                self.temp_vars.insert(format!("{}_dt", node.id), "dt".to_string());
+            }
+            
+            "event/collision" => {
+                self.write_line("for event in physics.get_collision_events() {");
+                self.indent();
+                self.temp_vars.insert(format!("{}_entity_a", node.id), "event.entity_a".to_string());
+                self.temp_vars.insert(format!("{}_entity_b", node.id), "event.entity_b".to_string());
+                self.temp_vars.insert(format!("{}_contact", node.id), "event.contact".to_string());
+            }
+            
+            "query/get_entities" => {
+                let components = node.data.get("components")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>())
+                    .unwrap_or_else(|| vec!["Transform"]);
+                
+                let query_var = self.gen_var("query");
+                let component_refs = components.iter()
+                    .map(|c| format!("&{}", c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                
+                self.write_line(&format!(
+                    "for (entity, ({})) in world.query::<({})>().iter() {{",
+                    components.join(", "),
+                    component_refs
+                ));
+                self.indent();
+                
+                self.temp_vars.insert(format!("{}_entities", node.id), "entity".to_string());
+            }
+            
+            "component/get" => {
+                let entity_var = self.get_input(&node.id, "entity")
+                    .unwrap_or_else(|| "entity".to_string());
+                let component_type = node.data.get("componentType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Transform");
+                
+                let output_var = self.gen_var("component");
+                self.write_line(&format!(
+                    "if let Some({}) = world.get_component::<{}>({}) {{",
+                    output_var, component_type, entity_var
+                ));
+                self.indent();
+                
+                self.temp_vars.insert(node.id.clone(), output_var);
+            }
+            
+            "component/set" => {
+                let entity_var = self.get_input(&node.id, "entity")
+                    .unwrap_or_else(|| "entity".to_string());
+                let component_var = self.get_input(&node.id, "component")
+                    .ok_or_else(|| CompilerError::InvalidConnection("Missing component input".to_string()))?;
+                
+                self.write_line(&format!(
+                    "world.add_component({}, {});",
+                    entity_var, component_var
+                ));
+            }
+            
+            "transform/translate" => {
+                let transform_var = self.get_input(&node.id, "transform")
+                    .ok_or_else(|| CompilerError::InvalidConnection("Missing transform input".to_string()))?;
+                let delta_var = self.get_input(&node.id, "delta")
+                    .unwrap_or_else(|| "Vec3::ZERO".to_string());
+                
+                self.write_line(&format!(
+                    "{}.position += {};",
+                    transform_var, delta_var
+                ));
+            }
+            
+            "math/add" => {
+                let a = self.get_input(&node.id, "a").unwrap_or_else(|| "0.0".to_string());
+                let b = self.get_input(&node.id, "b").unwrap_or_else(|| "0.0".to_string());
+                let output_var = self.gen_var("sum");
+                
+                self.write_line(&format!("let {} = {} + {};", output_var, a, b));
+                self.temp_vars.insert(node.id.clone(), output_var);
+            }
+            
+            "math/multiply" => {
+                let a = self.get_input(&node.id, "a").unwrap_or_else(|| "1.0".to_string());
+                let b = self.get_input(&node.id, "b").unwrap_or_else(|| "1.0".to_string());
+                let output_var = self.gen_var("product");
+                
+                self.write_line(&format!("let {} = {} * {};", output_var, a, b));
+                self.temp_vars.insert(node.id.clone(), output_var);
+            }
+            
+            "flow/if" => {
+                let condition = self.get_input(&node.id, "condition")
+                    .unwrap_or_else(|| "false".to_string());
+                
+                self.write_line(&format!("if {} {{", condition));
+                self.indent();
+                // The then/else branches would be handled by connected nodes
+            }
+            
+            "flow/foreach" => {
+                let array = self.get_input(&node.id, "array")
+                    .ok_or_else(|| CompilerError::InvalidConnection("Missing array input".to_string()))?;
+                let item_var = self.gen_var("item");
+                
+                self.write_line(&format!("for {} in {}.iter() {{", item_var, array));
+                self.indent();
+                
+                self.temp_vars.insert(format!("{}_item", node.id), item_var);
+            }
+            
+            "action/spawn" => {
+                let position = self.get_input(&node.id, "position")
+                    .unwrap_or_else(|| "Vec3::ZERO".to_string());
+                let prefab = node.data.get("prefab")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default");
+                
+                self.write_line("let new_entity = world.create_entity();");
+                self.write_line(&format!(
+                    "world.add_component(new_entity, Transform::from_position({}));",
+                    position
+                ));
+                
+                // Add prefab-specific components
+                self.write_line(&format!("// TODO: Load prefab '{}'", prefab));
+            }
+            
+            "action/destroy" => {
+                let entity = self.get_input(&node.id, "entity")
+                    .unwrap_or_else(|| "entity".to_string());
+                
+                self.write_line(&format!("world.destroy_entity({});", entity));
+            }
+            
+            _ => {
+                return Err(CompilerError::UnknownNode(node.get_type().to_string()));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn topological_sort(
+        &self,
+        nodes: &[VisualScriptNode],
+        connections: &[crate::VisualScriptConnection]
+    ) -> Result<Vec<&VisualScriptNode>, CompilerError> {
+        let mut sorted = Vec::new();
+        let mut visited = HashSet::new();
+        let mut temp_visited = HashSet::new();
+        
+        let node_map: HashMap<_, _> = nodes.iter()
+            .map(|n| (n.id.as_str(), n))
+            .collect();
+        
+        // Build adjacency list
+        let mut graph: HashMap<&str, Vec<&str>> = HashMap::new();
+        for node in nodes {
+            graph.insert(&node.id, Vec::new());
+        }
+        
+        for conn in connections {
+            if let Some(neighbors) = graph.get_mut(conn.source.as_str()) {
+                neighbors.push(&conn.target);
+            }
+        }
+        
+        fn visit<'a>(
+            node_id: &str,
+            graph: &HashMap<&str, Vec<&str>>,
+            node_map: &HashMap<&str, &'a VisualScriptNode>,
+            visited: &mut HashSet<String>,
+            temp_visited: &mut HashSet<String>,
+            sorted: &mut Vec<&'a VisualScriptNode>
+        ) -> Result<(), CompilerError> {
+            if temp_visited.contains(node_id) {
+                return Err(CompilerError::InvalidConnection("Cycle detected".to_string()));
+            }
+            
+            if !visited.contains(node_id) {
+                temp_visited.insert(node_id.to_string());
+                
+                if let Some(neighbors) = graph.get(node_id) {
+                    for &neighbor in neighbors {
+                        visit(neighbor, graph, node_map, visited, temp_visited, sorted)?;
+                    }
+                }
+                
+                temp_visited.remove(node_id);
+                visited.insert(node_id.to_string());
+                
+                if let Some(node) = node_map.get(node_id) {
+                    sorted.push(node);
+                }
+            }
+            
+            Ok(())
+        }
+        
+        for node in nodes {
+            if !visited.contains(&node.id) {
+                visit(&node.id, &graph, &node_map, &mut visited, &mut temp_visited, &mut sorted)?;
+            }
+        }
+        
+        sorted.reverse();
+        Ok(sorted)
+    }
+    
+    fn get_input(&self, node_id: &str, input_name: &str) -> Option<String> {
+        self.temp_vars.get(&format!("{}_{}", node_id, input_name)).cloned()
+    }
+    
+    fn gen_var(&mut self, prefix: &str) -> String {
+        let var = format!("{}_{}", prefix, self.var_counter);
+        self.var_counter += 1;
+        var
+    }
+    
+    fn write_line(&mut self, line: &str) {
+        let indent = "    ".repeat(self.indent_level);
+        self.code.push(format!("{}{}", indent, line));
+    }
+    
+    fn indent(&mut self) {
+        self.indent_level += 1;
+    }
+    
+    fn dedent(&mut self) {
+        if self.indent_level > 0 {
+            self.indent_level -= 1;
+        }
+    }
+    
+    fn to_rust_name(&self, name: &str) -> String {
+        name.chars()
+            .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '_')
+            .collect::<String>()
+            .split_whitespace()
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(first) => first.to_uppercase().chain(chars).collect(),
+                }
+            })
+            .collect()
+    }
 }
+
+// Export functionality
+pub use builder::{GameCompiler, BuildTarget, BuildResult};

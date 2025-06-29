@@ -3,16 +3,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
-// Re-export commonly used types
-pub use ecs::*;
-pub use math::*;
-pub use renderer::*;
+pub mod ecs;
+pub mod math;
+pub mod renderer;
+pub mod physics;
+pub mod compiler;
+pub mod assets;
 
-mod ecs;
-mod math;
-mod renderer;
-mod physics;
-mod compiler;
+// Re-export commonly used types
+pub use ecs::{Component, World, System, SystemSchedule, EntityId};
+pub use math::{Vec2, Vec3, Quat, Transform};
+pub use renderer::{Renderer, Sprite, create_renderer, RendererBackend};
+pub use physics::{PhysicsWorld, RigidBody, Collider, BodyType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -34,17 +36,18 @@ impl Default for EngineConfig {
 pub struct DreamEngine {
     world: World,
     renderer: Box<dyn Renderer>,
-    physics: physics::PhysicsWorld,
+    physics: PhysicsWorld,
     systems: SystemSchedule,
     config: EngineConfig,
     accumulator: f32,
+    time: f32,
 }
 
 impl DreamEngine {
     pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
         let world = World::with_capacity(config.max_entities);
-        let renderer = create_renderer()?;
-        let physics = physics::PhysicsWorld::new();
+        let renderer = create_renderer(RendererBackend::Canvas)?;
+        let physics = PhysicsWorld::new();
         let systems = SystemSchedule::new();
         
         Ok(Self {
@@ -54,7 +57,28 @@ impl DreamEngine {
             systems,
             config,
             accumulator: 0.0,
+            time: 0.0,
         })
+    }
+    
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+    
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+    
+    pub fn physics(&self) -> &PhysicsWorld {
+        &self.physics
+    }
+    
+    pub fn physics_mut(&mut self) -> &mut PhysicsWorld {
+        &mut self.physics
+    }
+    
+    pub fn systems_mut(&mut self) -> &mut SystemSchedule {
+        &mut self.systems
     }
     
     pub fn update(&mut self, dt: f32) {
@@ -64,6 +88,7 @@ impl DreamEngine {
         while self.accumulator >= self.config.fixed_timestep {
             self.fixed_update(self.config.fixed_timestep);
             self.accumulator -= self.config.fixed_timestep;
+            self.time += self.config.fixed_timestep;
         }
         
         // Interpolate rendering
@@ -72,29 +97,31 @@ impl DreamEngine {
     }
     
     fn fixed_update(&mut self, dt: f32) {
-        // Run systems in optimal order
+        // Update physics
+        self.physics.step(dt);
+        
+        // Run systems
         self.systems.execute(&mut self.world, &mut self.physics, dt);
     }
     
     fn render(&mut self, interpolation: f32) {
         self.renderer.begin_frame();
+        self.renderer.clear([0.1, 0.1, 0.2, 1.0]);
         
         // Render all entities with sprite components
-        let query = self.world.query::<(&Transform, &Sprite)>();
-        for (transform, sprite) in query.iter() {
+        for (entity, (transform, sprite)) in self.world.query::<(&Transform, &Sprite)>().iter() {
             self.renderer.draw_sprite(sprite, transform, interpolation);
         }
         
         self.renderer.end_frame();
     }
     
+    pub fn get_render_frame(&self) -> Option<Vec<u8>> {
+        self.renderer.get_frame_data()
+    }
+    
     pub fn load_compiled_game(&mut self, data: &[u8]) -> Result<(), EngineError> {
         let game: CompiledGame = bincode::deserialize(data)?;
-        
-        // Load systems
-        for system in game.systems {
-            self.systems.add_system(system);
-        }
         
         // Create entities
         for entity_data in game.entities {
@@ -116,255 +143,42 @@ impl DreamEngine {
             self.world.add_component(entity, sprite);
         }
         
-        // Add other components...
+        if let Some(body) = data.rigid_body {
+            self.world.add_component(entity, body);
+            self.physics.add_rigid_body(entity, body);
+        }
+        
+        if let Some(collider) = data.collider {
+            self.world.add_component(entity, collider);
+            self.physics.add_collider(entity, collider);
+        }
         
         Ok(entity)
     }
-}
-
-// ECS Module
-mod ecs {
-    use super::*;
     
-    pub type EntityId = u32;
-    pub type ComponentId = std::any::TypeId;
-    
-    #[derive(Default)]
-    pub struct World {
-        entities: Vec<EntityId>,
-        components: ComponentStorage,
-        next_entity_id: EntityId,
-    }
-    
-    impl World {
-        pub fn with_capacity(capacity: usize) -> Self {
-            Self {
-                entities: Vec::with_capacity(capacity),
-                components: ComponentStorage::new(),
-                next_entity_id: 0,
-            }
-        }
+    pub fn create_test_scene(&mut self) {
+        // Create a test entity with a sprite
+        let entity = self.world.create_entity();
         
-        pub fn create_entity(&mut self) -> EntityId {
-            let id = self.next_entity_id;
-            self.next_entity_id += 1;
-            self.entities.push(id);
-            id
-        }
+        self.world.add_component(entity, Transform::from_position(Vec3::new(400.0, 300.0, 0.0)));
+        self.world.add_component(entity, Sprite {
+            texture_id: "test_sprite".to_string(),
+            color: [1.0, 1.0, 1.0, 1.0],
+            ..Default::default()
+        });
         
-        pub fn add_component<T: Component>(&mut self, entity: EntityId, component: T) {
-            self.components.insert(entity, component);
-        }
+        // Add physics
+        let body = RigidBody::new(Vec2::new(400.0, 300.0), BodyType::Dynamic)
+            .with_mass(1.0)
+            .with_velocity(Vec2::new(50.0, 0.0));
+        self.world.add_component(entity, body.clone());
+        self.physics.add_rigid_body(entity, body);
         
-        pub fn query<Q: Query>(&self) -> QueryIter<Q> {
-            Q::query(&self.components)
-        }
-    }
-    
-    pub trait Component: Send + Sync + 'static {}
-    
-    pub trait System: Send + Sync {
-        fn execute(&mut self, world: &mut World, physics: &mut physics::PhysicsWorld, dt: f32);
-    }
-    
-    pub struct SystemSchedule {
-        systems: Vec<Box<dyn System>>,
-    }
-    
-    impl SystemSchedule {
-        pub fn new() -> Self {
-            Self {
-                systems: Vec::new(),
-            }
-        }
-        
-        pub fn add_system(&mut self, system: Box<dyn System>) {
-            self.systems.push(system);
-        }
-        
-        pub fn execute(&mut self, world: &mut World, physics: &mut physics::PhysicsWorld, dt: f32) {
-            for system in &mut self.systems {
-                system.execute(world, physics, dt);
-            }
-        }
-    }
-    
-    // Component storage with cache-friendly layout
-    pub struct ComponentStorage {
-        storages: HashMap<ComponentId, Box<dyn ComponentStorageBase>>,
-    }
-    
-    impl ComponentStorage {
-        pub fn new() -> Self {
-            Self {
-                storages: HashMap::new(),
-            }
-        }
-        
-        pub fn insert<T: Component>(&mut self, entity: EntityId, component: T) {
-            let type_id = std::any::TypeId::of::<T>();
-            let storage = self.storages
-                .entry(type_id)
-                .or_insert_with(|| Box::new(ComponentVec::<T>::new()));
-            
-            let typed_storage = storage.as_any_mut()
-                .downcast_mut::<ComponentVec<T>>()
-                .unwrap();
-            
-            typed_storage.insert(entity, component);
-        }
-    }
-    
-    trait ComponentStorageBase: Send + Sync {
-        fn as_any(&self) -> &dyn std::any::Any;
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
-    }
-    
-    struct ComponentVec<T: Component> {
-        components: Vec<Option<T>>,
-        entities: Vec<EntityId>,
-    }
-    
-    impl<T: Component> ComponentVec<T> {
-        fn new() -> Self {
-            Self {
-                components: Vec::new(),
-                entities: Vec::new(),
-            }
-        }
-        
-        fn insert(&mut self, entity: EntityId, component: T) {
-            // Simple implementation - would use sparse set in production
-            if entity as usize >= self.components.len() {
-                self.components.resize_with(entity as usize + 1, || None);
-            }
-            self.components[entity as usize] = Some(component);
-            self.entities.push(entity);
-        }
-    }
-    
-    impl<T: Component> ComponentStorageBase for ComponentVec<T> {
-        fn as_any(&self) -> &dyn std::any::Any { self }
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-    }
-    
-    // Query system for efficient iteration
-    pub trait Query {
-        type Item;
-        fn query(storage: &ComponentStorage) -> QueryIter<Self>;
-    }
-    
-    pub struct QueryIter<Q: Query> {
-        _phantom: std::marker::PhantomData<Q>,
-    }
-    
-    impl<Q: Query> QueryIter<Q> {
-        pub fn iter(&self) -> impl Iterator<Item = Q::Item> {
-            // Simplified - would implement actual iteration
-            std::iter::empty()
-        }
+        let collider = Collider::circle(32.0);
+        self.world.add_component(entity, collider.clone());
+        self.physics.add_collider(entity, collider);
     }
 }
-
-// Math module
-mod math {
-    use serde::{Deserialize, Serialize};
-    
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-    pub struct Vec2 {
-        pub x: f32,
-        pub y: f32,
-    }
-    
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-    pub struct Vec3 {
-        pub x: f32,
-        pub y: f32,
-        pub z: f32,
-    }
-    
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-    pub struct Quat {
-        pub x: f32,
-        pub y: f32,
-        pub z: f32,
-        pub w: f32,
-    }
-}
-
-// Renderer module
-mod renderer {
-    use super::*;
-    
-    pub trait Renderer: Send + Sync {
-        fn begin_frame(&mut self);
-        fn end_frame(&mut self);
-        fn draw_sprite(&mut self, sprite: &Sprite, transform: &Transform, interpolation: f32);
-    }
-    
-    pub fn create_renderer() -> Result<Box<dyn Renderer>, EngineError> {
-        // Would create appropriate renderer based on platform
-        Ok(Box::new(NullRenderer))
-    }
-    
-    struct NullRenderer;
-    
-    impl Renderer for NullRenderer {
-        fn begin_frame(&mut self) {}
-        fn end_frame(&mut self) {}
-        fn draw_sprite(&mut self, _: &Sprite, _: &Transform, _: f32) {}
-    }
-}
-
-// Physics module
-mod physics {
-    use super::*;
-    
-    pub struct PhysicsWorld {
-        bodies: Vec<RigidBody>,
-    }
-    
-    impl PhysicsWorld {
-        pub fn new() -> Self {
-            Self {
-                bodies: Vec::new(),
-            }
-        }
-        
-        pub fn step(&mut self, dt: f32) {
-            // Simple physics integration
-            for body in &mut self.bodies {
-                body.position += body.velocity * dt;
-            }
-        }
-    }
-    
-    pub struct RigidBody {
-        position: Vec2,
-        velocity: Vec2,
-        mass: f32,
-    }
-}
-
-// Common components
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Transform {
-    pub position: Vec3,
-    pub rotation: Quat,
-    pub scale: Vec3,
-}
-
-impl Component for Transform {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Sprite {
-    pub texture_id: String,
-    pub color: [f32; 4],
-    pub flip_x: bool,
-    pub flip_y: bool,
-}
-
-impl Component for Sprite {}
 
 // Error handling
 #[derive(Debug, thiserror::Error)]
@@ -377,12 +191,17 @@ pub enum EngineError {
     
     #[error("Component not found")]
     ComponentNotFound,
+    
+    #[error("Entity not found")]
+    EntityNotFound,
+    
+    #[error("System error: {0}")]
+    SystemError(String),
 }
 
 // Compiled game format
 #[derive(Serialize, Deserialize)]
 pub struct CompiledGame {
-    pub systems: Vec<Box<dyn System>>,
     pub entities: Vec<EntityData>,
     pub assets: HashMap<String, Vec<u8>>,
 }
@@ -392,100 +211,158 @@ pub struct EntityData {
     pub name: String,
     pub transform: Option<Transform>,
     pub sprite: Option<Sprite>,
-    // Other components...
-}
-
-// Module for visual script compilation
-mod compiler {
-    use super::*;
-    
-    pub struct CompiledSystem {
-        pub name: String,
-        pub code: String,
-    }
-    
-    pub fn compile_visual_script(script: &VisualScript) -> Result<CompiledSystem, CompilerError> {
-        let mut code = String::new();
-        
-        // Generate system struct
-        code.push_str(&format!("pub struct {}System;\n\n", script.name));
-        code.push_str(&format!("impl System for {}System {{\n", script.name));
-        code.push_str("    fn execute(&mut self, world: &mut World, physics: &mut PhysicsWorld, dt: f32) {\n");
-        
-        // Compile nodes to Rust code
-        for node in &script.nodes {
-            code.push_str(&compile_node(node)?);
-        }
-        
-        code.push_str("    }\n}\n");
-        
-        Ok(CompiledSystem {
-            name: script.name.clone(),
-            code,
-        })
-    }
-    
-    fn compile_node(node: &VisualScriptNode) -> Result<String, CompilerError> {
-        match node.node_type.as_str() {
-            "OnUpdate" => Ok("// Update logic\n".to_string()),
-            "GetComponent" => Ok(format!(
-                "let component = world.get_component::<{}>(entity);\n",
-                node.data.get("component_type").unwrap()
-            )),
-            _ => Err(CompilerError::UnknownNode(node.node_type.clone())),
-        }
-    }
-    
-    #[derive(Debug, thiserror::Error)]
-    pub enum CompilerError {
-        #[error("Unknown node type: {0}")]
-        UnknownNode(String),
-    }
+    pub rigid_body: Option<RigidBody>,
+    pub collider: Option<Collider>,
 }
 
 // Visual script types (shared with TypeScript)
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct VisualScript {
+    pub id: String,
     pub name: String,
     pub nodes: Vec<VisualScriptNode>,
     pub connections: Vec<VisualScriptConnection>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct VisualScriptNode {
     pub id: String,
     pub node_type: String,
+    #[serde(rename = "type")]
+    pub node_type_alt: Option<String>, // Handle both 'node_type' and 'type' from TypeScript
     pub position: (f32, f32),
     pub data: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Serialize, Deserialize)]
+impl VisualScriptNode {
+    pub fn get_type(&self) -> &str {
+        self.node_type_alt.as_ref().unwrap_or(&self.node_type)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct VisualScriptConnection {
+    pub id: String,
     pub source: String,
     pub source_handle: String,
     pub target: String,
     pub target_handle: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub scenes: Vec<Scene>,
+    pub scripts: Vec<VisualScript>,
+    pub assets: Vec<AssetInfo>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Scene {
+    pub id: String,
+    pub name: String,
+    pub objects: Vec<GameObject>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GameObject {
+    pub id: String,
+    pub name: String,
+    pub position: math::Vec2,
+    pub rotation: f32,
+    pub scale: math::Vec2,
+    pub components: Vec<ComponentData>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ComponentData {
+    pub component_type: String,
+    pub data: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AssetInfo {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub asset_type: String,
+}
+
 // Integration with Tauri
 #[cfg(feature = "tauri-integration")]
 pub mod tauri_integration {
     use super::*;
-    use tauri::command;
+    use std::sync::Mutex;
+    use once_cell::sync::Lazy;
     
-    #[command]
-    pub async fn create_engine_preview() -> Result<String, String> {
+    // Global storage for preview engines
+    static PREVIEW_ENGINES: Lazy<Mutex<HashMap<String, Arc<Mutex<DreamEngine>>>>> = 
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    
+    pub fn create_preview_engine(project_id: String) -> Result<String, String> {
         let engine = DreamEngine::new(EngineConfig::default())
             .map_err(|e| e.to_string())?;
         
-        // Return handle to engine
-        Ok("engine_handle_123".to_string())
+        // Add a test scene for now
+        let mut engine = engine;
+        engine.create_test_scene();
+        
+        let engine_id = format!("engine_{}", project_id);
+        let engine_arc = Arc::new(Mutex::new(engine));
+        
+        PREVIEW_ENGINES.lock().unwrap()
+            .insert(engine_id.clone(), engine_arc);
+        
+        Ok(engine_id)
     }
     
-    #[command]
-    pub async fn update_preview_scene(handle: String, scene_data: Vec<u8>) -> Result<(), String> {
-        // Update the preview engine with new scene data
+    pub fn update_preview_scene(engine_id: String, scene_data: Vec<u8>) -> Result<(), String> {
+        let engines = PREVIEW_ENGINES.lock().unwrap();
+        let engine = engines.get(&engine_id)
+            .ok_or_else(|| "Engine not found".to_string())?;
+        
+        let mut engine = engine.lock().unwrap();
+        
+        // Clear current scene
+        engine.world_mut().clear();
+        
+        // Load new scene data
+        // This would deserialize the scene_data and create entities
+        
         Ok(())
+    }
+    
+    pub fn render_preview_frame(engine_id: String, dt: f32) -> Result<Vec<u8>, String> {
+        let engines = PREVIEW_ENGINES.lock().unwrap();
+        let engine = engines.get(&engine_id)
+            .ok_or_else(|| "Engine not found".to_string())?;
+        
+        let mut engine = engine.lock().unwrap();
+        
+        // Update engine
+        engine.update(dt);
+        
+        // Get render data
+        engine.get_render_frame()
+            .ok_or_else(|| "No frame data available".to_string())
+    }
+    
+    pub fn destroy_preview_engine(engine_id: String) -> Result<(), String> {
+        PREVIEW_ENGINES.lock().unwrap()
+            .remove(&engine_id)
+            .ok_or_else(|| "Engine not found".to_string())?;
+        
+        Ok(())
+    }
+    
+    pub fn compile_visual_script(script_json: String) -> Result<String, String> {
+        let script: VisualScript = serde_json::from_str(&script_json)
+            .map_err(|e| format!("Failed to parse script: {}", e))?;
+        
+        compiler::compile_visual_script(&script)
+            .map(|compiled| compiled.code)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -511,5 +388,23 @@ mod tests {
         });
         
         assert_eq!(entity, 0);
+    }
+    
+    #[test]
+    fn test_physics_integration() {
+        let mut engine = DreamEngine::new(EngineConfig::default()).unwrap();
+        
+        // Create entity with physics
+        let entity = engine.world_mut().create_entity();
+        
+        let body = RigidBody::new(Vec2::ZERO, BodyType::Dynamic);
+        engine.world_mut().add_component(entity, body.clone());
+        engine.physics_mut().add_rigid_body(entity, body);
+        
+        // Run a physics step
+        engine.update(1.0 / 60.0);
+        
+        // Check that physics ran
+        assert!(engine.physics().get_body(entity).is_some());
     }
 }
