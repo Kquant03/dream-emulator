@@ -1,0 +1,107 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Testing
+coverage/
+*.lcov
+.nyc_output/
+
+# Production builds
+dist/
+dist-ssr/
+build/
+*.local
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/.cargo/config.toml
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env*.local
+
+# Package manager lock files (optional - you may want to keep these)
+# Uncomment if you want to track lock files
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+.cache/
+tmp/
+temp/
+
+# TypeScript
+*.tsbuildinfo
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Optional stylelint cache
+.stylelintcache
+
+# Rust
+debug/
+**/*.rs.bk
+*.pdb
+
+# Project specific
+run-tauri-dev.sh
+run-dev.sh
+projset.sh
+
+# Game-specific
+/assets/user/
+/saves/
+*.save
+*.bak
